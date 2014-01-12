@@ -30,6 +30,16 @@
   (swap! (.-tvals iref) dissoc (.-id tx))
   (throw RetryException))
 
+(defn error?
+  [x]
+  (instance? js/Error x))
+
+(defn throw-err
+  [x]
+  (if (error? x)
+    (throw x)
+    x))
+
 (defn tx-id
   []
   (cond
@@ -151,7 +161,9 @@
         (recur (<! ret))
         (try (commitTransaction tx)
              (catch js/Error err
-               (runInTransaction tx f))))))
+               (if (identical? err RetryException)
+                 (runInTransaction tx f)
+                 (throw err)))))))
   IPrintWithWriter
   (-pr-writer [tx writer opts]
     (pr-writer {:id id :sets sets :alters alters :commutes commutes}
