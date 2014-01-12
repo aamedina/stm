@@ -10,6 +10,11 @@
 
 (enable-console-print!)
 
+(defprotocol ILock
+  (lock [_ tx])
+  (unlock [_ tx])
+  (locked? [_]))
+
 (defprotocol IRef
   (setState [iref newval])
   (commitRef [iref tx])
@@ -50,13 +55,24 @@
     :else (let [t (.getTime (js/Date.))] (if (get @stm t) (recur) t))))
 
 (defn tx-set
-  ([] (avl/sorted-set-by (fn [[k1 v2] [k2 v2]] (compare k1 k2))))
+  ([] (avl/sorted-set-by #(compare (:tx-id (meta %1)) (:tx-id (meta %2)))))
   ([& ks]
-     (apply avl/sorted-set-by (fn [[k1 v2] [k2 v2]] (compare k1 k2)) ks)))
+     (apply avl/sorted-set-by
+            #(compare (:tx-id (meta %1)) (:tx-id (meta %2))) ks)))
 
-(deftype Ref [state tvals meta validator watches]
+(deftype Ref [state lock tvals meta validator watches]
+  ILock
+  (lock [iref tx] (set! (.-lock iref) (.-id tx)))
+  (unlock [iref tx]
+    (when (== lock (.-id tx))
+      (set! (.-lock iref) nil)))
+  (locked? [iref] (not (nil? lock)))
   IEquiv
   (-equiv [iref other] (identical? iref other))
+  IWithMeta
+  (-with-meta [iref meta]
+    (set! (.-meta iref) meta)
+    iref)
   IMeta
   (-meta [_] meta)
   IDeref
@@ -112,7 +128,7 @@
 (defn clear!
   [refs tx]
   (if-not (empty? refs)
-    (do (doseq [[_ ref] refs]
+    (do (doseq [ref refs]
           (swap! (.-tvals ref) dissoc (.-id tx)))
         (empty refs))
     refs))
@@ -121,15 +137,12 @@
   ITransaction
   (commitTransaction [tx]
     (let [refs (reduce into (tx-set) [@sets @alters @commutes])]
-      (doseq [[_ ref] refs]
+      (doseq [ref refs]
         (commitRef ref tx))
-      (swap! sets clear! tx)
-      (swap! alters clear! tx)
-      (swap! commutes clear! tx)
       (swap! stm dissoc id)))
   (doSet [tx iref newval]
-    (when-not (contains? (set (vals @sets)) iref)
-      (swap! sets conj [(tx-id) iref]))
+    (when-not (contains? @sets iref)
+      (swap! sets conj (with-meta iref {:tx-id (tx-id)})))
     (let [state (or (first (get @(.-tvals iref) id)) (.-state iref))]
       (if (identical? (.-state iref) state)
         (swap! (.-tvals iref) update-in [id]
@@ -137,8 +150,8 @@
         (retry-transaction tx iref))
       newval))
   (doAlter [tx iref f args]
-    (when-not (contains? (set (vals @alters)) iref)
-      (swap! alters conj [(tx-id) iref]))
+    (when-not (contains? @alters iref)
+      (swap! alters conj (with-meta iref {:tx-id (tx-id)})))
     (let [newval (apply f (cons (deref-with-tx iref tx) args))
           state (or (first (get @(.-tvals iref) id)) (.-state iref))]
       (if (identical? (.-state iref) state)
@@ -147,22 +160,23 @@
         (retry-transaction tx iref))
       newval))
   (doCommute [tx iref f args]
-    (when-not (contains? (set (vals @commutes)) iref)
-      (swap! commutes conj [(tx-id) iref]))
+    (when-not (contains? @commutes iref)
+      (swap! commutes conj (with-meta iref {:tx-id (tx-id)})))
     (let [newval (apply f (cons (deref-with-tx iref tx) args))]
       (swap! (.-tvals iref) update-in [id]
              (fnil conj [(.-state iref)]) newval)
       newval))
   (runInTransaction [tx f]
-    (swap! sets clear! tx)
-    (swap! alters clear! tx)
-    (swap! commutes clear! tx)
-    (go (try (exhaust-channel (f))
-             (commitTransaction tx)
-             (catch js/Error err
-               (if (identical? err RetryException)
-                 (runInTransaction tx f)
-                 (throw err))))))
+    (go-loop []
+      (swap! sets clear! tx)
+      (swap! alters clear! tx)
+      (swap! commutes clear! tx)
+      (try (exhaust-channel (f))
+           (commitTransaction tx)
+           (catch js/Error err
+             (if (identical? err RetryException)
+               (recur)
+               (throw err))))))
   IPrintWithWriter
   (-pr-writer [tx writer opts]
     (pr-writer {:id id :sets sets :alters alters :commutes commutes}
@@ -178,8 +192,8 @@
 (defn ^:export -main []
   (let [r (ref 0)]
     (dotimes [i 10]
-      (go (println (<! (dosync tx
-                         (dotimes [i 10]
-                           (alter r tx inc)))))
+      (go (<! (dosync tx
+                (dotimes [i 10]
+                  (alter r tx inc))))
           (println "Committed value of ref is :" @r)))
     (def r r)))
