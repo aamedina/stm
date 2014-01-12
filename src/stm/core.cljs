@@ -5,7 +5,7 @@
             [clojure.data.avl :as avl]
             [cljs.core.async.impl.protocols :as impl])
   (:require-macros [cljs.core.async.macros :as a :refer [go go-loop]]
-                   [react.core :refer [<? dosync]]))
+                   [stm.core :refer [<? dosync]]))
 
 (enable-console-print!)
 
