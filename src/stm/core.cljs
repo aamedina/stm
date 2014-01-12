@@ -3,9 +3,10 @@
             [cljs.core.async :as a :refer [<! >! put! take! chan]]
             [clojure.set :as set]
             [clojure.data.avl :as avl]
-            [cljs.core.async.impl.protocols :as impl])
+            [cljs.core.async.impl.protocols :as impl]
+            [cljs.core.async.impl.channels :refer [ManyToManyChannel]])
   (:require-macros [cljs.core.async.macros :as a :refer [go go-loop]]
-                   [stm.core :refer [<? dosync]]))
+                   [stm.core :refer [<? dosync exhaust-channel]]))
 
 (enable-console-print!)
 
@@ -156,14 +157,12 @@
     (swap! sets clear! tx)
     (swap! alters clear! tx)
     (swap! commutes clear! tx)
-    (go-loop [ret (f)]
-      (if (satisfies? impl/ReadPort ret)
-        (recur (<! ret))
-        (try (commitTransaction tx)
+    (go (try (exhaust-channel (f))
+             (commitTransaction tx)
              (catch js/Error err
                (if (identical? err RetryException)
                  (runInTransaction tx f)
-                 (throw err)))))))
+                 (throw err))))))
   IPrintWithWriter
   (-pr-writer [tx writer opts]
     (pr-writer {:id id :sets sets :alters alters :commutes commutes}
@@ -175,3 +174,12 @@
                        (atom (tx-set))
                        (atom (tx-set))
                        (atom (tx-set))))
+
+(defn ^:export -main []
+  (let [r (ref 0)]
+    (dotimes [i 10]
+      (go (println (<! (dosync tx
+                         (dotimes [i 10]
+                           (alter r tx inc)))))
+          (println "Committed value of ref is :" @r)))
+    (def r r)))
