@@ -62,7 +62,8 @@
 
 (deftype Ref [state lock tvals meta validator watches]
   ILock
-  (lock [iref tx] (set! (.-lock iref) (.-id tx)))
+  (lock [iref tx]
+    (set! (.-lock iref) (.-id tx)))
   (unlock [iref tx]
     (when (== lock (.-id tx))
       (set! (.-lock iref) nil)))
