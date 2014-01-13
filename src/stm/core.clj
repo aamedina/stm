@@ -26,15 +26,10 @@
   `(let [~binding-name (if (core/exists? ~binding-name)
                          ~binding-name
                          (locking-transaction))
+         fn# (fn [] ~@body)
          tx# ~binding-name]
      (swap! stm assoc (.-id tx#) tx#)
-     (loop [fn# (fn [] ~@body)
-            tx# tx#]
-       (try (runInTransaction tx# fn#)
-            (catch js/Error err#
-              (if (identical? err# RetryException)
-                (recur tx# fn#)
-                (throw err#)))))))
+     (runInTransaction tx# fn#)))
 
 (defmacro compare-and-set!
   [prop oldval newval]
