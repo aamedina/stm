@@ -29,10 +29,19 @@
   (doEnsure [tx ref])
   (doCommute [tx ref f args])
   (runInTransaction [tx f])
+  (tryWriteLock [tx ref])
   (stop [tx status])
   (run [tx f])
   (release-if-ensured [tx ref])
-  (block-and-bail [tx ref]))
+  (block-and-bail [tx ref])
+  (barge [tx ref])
+  (lock-tx [tx ref]))
+
+(def RUNNING 0)
+(def COMMITTING 1)
+(def RETRY 2)
+(def KILLED 3)
+(def COMMITTED 4)
 
 (def stm (atom (sorted-map)))
 
@@ -63,6 +72,12 @@
     (js/window.performance.webKitNow)
     :else (let [t (.getTime (js/Date.))] (if (get @stm t) (recur) t))))
 
+(def BARGE_WAIT_NANOS (* 10 1000000))
+
+(defn ^boolean barge-time-elapsed?
+  [tx]
+  (> (- (tx-id) (.-startTime tx)) BARGE_WAIT_NANOS))
+
 (deftype TVal [point val])
 
 (deftype Ref [id state read-lock write-lock tvals meta validator watches]
@@ -70,9 +85,11 @@
   (-compare [x y] (-compare id (.-id y)))
   ILock
   (lock [iref tx]
-    (set! (.-write_lock iref) (.-id tx)))
+    (when-not write-lock
+      (set! (.-write_lock iref) (.-id tx))))
   (lock [iref tx read?]
-    (set! (.-read_lock iref) (.-id tx)))
+    (when-not read-lock
+      (set! (.-read_lock iref) (.-id tx))))
   (unlock [iref tx]
     (when (== write-lock (.-id tx))
       (set! (.-write_lock iref) nil)))
@@ -164,6 +181,31 @@
         (empty refs))
     refs))
 
+(defprotocol ICountDownLatch
+  (countDown [latch])
+  (await [latch]))
+
+(deftype CountDownLatch [cnt port cyclic?]
+  ICountDownLatch
+  (await [latch]
+    (go-loop [cnt cnt]
+      (if (pos? cnt)
+        (recur ((<! port) cnt))
+        (when-not cyclic?
+          (a/close! port)))))
+  (countDown [latch]
+    (put! port dec)))
+
+(defn latch
+  [cnt]
+  (CountDownLatch. cnt (chan (a/dropping-buffer 1)) false))
+
+(defn cyclic-barrier
+  [cnt]
+  (CountDownLatch. cnt (chan (a/dropping-buffer 1)) true))
+
+(deftype Info [status startPoint latch])
+
 (deftype LockingTransaction [id status sets ensures commutes vals startPoint
                              readPoint writePoint lastPoint startTime]
   IEquiv
@@ -232,9 +274,9 @@
                (when (== i 0)
                  (swap! start-point @readPoint)
                  (swap! start-time (tx-id)))
-               (reset! status :running)
+               (reset! status RUNNING)
                (let [ret (f)]
-                 (if (compare-and-set! status :running :committing)
+                 (if (compare-and-set! status RUNNING COMMITTING)
                    (doseq [[ref fun] @commutes]
                      (when-not (contains? @sets ref)
                        (let [^boolean ensured? (contains? @ensures ref)]
@@ -261,11 +303,25 @@
     (swap! sets clear! tx)
     (swap! commutes clear! tx))
   (block-and-bail [tx ref] 
-    (stop tx :retry))
+    (stop tx RETRY))
   (release-if-ensured [tx ref]
     (when (contains? @(.-ensures tx) ref)
       (swap! (.-ensures tx) disj ref)
       (unlock ref :read)))
+  (tryWriteLock [tx ref]
+    (when-not (lock ref tx)
+      (retry-transaction tx ref)))
+  (barge [tx ref])
+  (lock-tx [tx ref]
+    (release-if-ensured tx ref)
+    (let [unlocked (atom true)]
+      (try (tryWriteLock tx ref)
+           (reset! unlocked false)
+           (when (and (seq @(.-tvals ref))
+                      (> (.-point (peek (get @(.-tvals ref) id))) readPoint))
+             (retry-transaction tx ref))
+           (when (and (== RUNNING status) )
+             (when-not (barge tx ref))))))
   IPrintWithWriter
   (-pr-writer [tx writer opts]
     (pr-writer {:id id :sets sets :ensures ensures :commutes commutes
@@ -275,10 +331,10 @@
 (defn locking-transaction
   []
   (LockingTransaction. (tx-id)
-                       (atom :init)
+                       (atom RUNNING)
                        (atom (sorted-set))
                        (atom (sorted-set))
-                       (atom (sorted-set))
+                       (atom (sorted-map))
                        (atom (sorted-map))
                        (atom 0) (atom 0) (atom 0) (atom 0) (atom 0)))
 
