@@ -210,10 +210,12 @@
     (let [timeout (a/timeout timeout-ms)]
       (go-loop [cnt cnt
                 [f ch] (alts! [port timeout])]
-        (cond
-          (identical? ch timeout) nil
-          (pos? cnt) (recur (f cnt) (alts! [port timeout]))
-          (not cyclic?) (a/close! port)))))
+        (condp identical? ch
+          timeout nil
+          port (if (pos? cnt)
+                 (recur (f cnt) (alts! [port timeout]))
+                 (when-not cyclic?
+                   (a/close! port)))))))
   (countDown [latch]
     (put! port dec)))
 
@@ -287,7 +289,7 @@
         (if (and refinfo (running? refinfo))
           (do (unlock iref :read)
               (when-not (identical? refinfo info)
-                (block-and-bail tx refinfo)))
+                (go (<? (block-and-bail tx refinfo)))))
           (swap! ensures conj iref)))))
   (doCommute [tx iref f args]
     (when-not (running? info)
@@ -376,11 +378,9 @@
                         (stop tx (if done COMMITTED RETRY))))
           ret))))
   (runInTransaction [tx f]
-    (try (run tx f)
-         (catch js/Error err
-           (if (identical? err RetryException)
-             (println err)
-             (throw err)))
+    (try (if (nil? info)
+           (run tx f)
+           (f))
          (finally (swap! stm dissoc id))))
   (stop [tx new-status]
     (when-not (nil? info)
@@ -390,9 +390,11 @@
       (swap! commutes empty)))
   (block-and-bail [tx refinfo] 
     (stop tx RETRY)
-    (go (try (<! (await (.-latch refinfo)))
-             ())
-        (throw RetryException)))
+    (go (try (<! (await (.-latch refinfo) 100))
+             (catch js/Error err
+               (when-not (identical? err RetryException)
+                 (throw err))))
+        RetryException))
   (release-if-ensured [tx ref]
     (when (contains? @(.-ensures tx) ref)
       (swap! (.-ensures tx) disj ref)
@@ -401,7 +403,12 @@
     (try (when-not (lock ref tx)
            (throw RetryException))
          (catch js/Error err (throw err))))
-  (barge [tx ref])
+  (barge [tx refinfo]
+    (when (and (barge-time-elapsed? tx) (< startPoint (.-startPoint refinfo)))
+      (let [barged (compare-and-set! (.-status refinfo) RUNNING KILLED)]
+        (when barged
+          (countDown (.-latch refinfo)))
+        barged)))
   (lock-tx [tx ref]
     (release-if-ensured tx ref)
     (let [unlocked (atom true)]
