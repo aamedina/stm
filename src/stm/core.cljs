@@ -24,12 +24,17 @@
 
 (defprotocol ITransaction
   (commitTransaction [tx])
+  (doGet [tx ref])
   (doSet [tx ref newval])
   (doEnsure [tx ref])
   (doCommute [tx ref f args])
-  (runInTransaction [tx f]))
+  (runInTransaction [tx f])
+  (stop [tx status])
+  (run [tx f])
+  (release-if-ensured [tx ref])
+  (block-and-bail [tx ref]))
 
-(def stm (atom (avl/sorted-map-by #(compare (.-id %1) (.-id %2)))))
+(def stm (atom (sorted-map)))
 
 (def ids (atom 0))
 
@@ -58,18 +63,11 @@
     (js/window.performance.webKitNow)
     :else (let [t (.getTime (js/Date.))] (if (get @stm t) (recur) t))))
 
-(defn tx-set
-  ([] (avl/sorted-set-by #(compare (:tx-id (meta %1)) (:tx-id (meta %2)))))
-  ([& ks]
-     (apply avl/sorted-set-by
-            #(compare (:tx-id (meta %1)) (:tx-id (meta %2))) ks)))
+(deftype TVal [point val])
 
 (deftype Ref [id state read-lock write-lock tvals meta validator watches]
   IComparable
-  (-compare [x y]
-    (if (instance? Ref y)
-      (-compare id (.-id y))
-      false))
+  (-compare [x y] (-compare id (.-id y)))
   ILock
   (lock [iref tx]
     (set! (.-write_lock iref) (.-id tx)))
@@ -166,7 +164,12 @@
         (empty refs))
     refs))
 
-(deftype LockingTransaction [id sets ensures commutes vals read write]
+(deftype LockingTransaction [id status sets ensures commutes vals startPoint
+                             readPoint writePoint lastPoint startTime]
+  IEquiv
+  (-equiv [x y] (identical? x y))
+  IComparable
+  (-compare [x y] (-compare id (.-id y)))
   ITransaction
   (commitTransaction [tx]
     (doseq [ref @sets]
@@ -176,6 +179,18 @@
     (doseq [ref @commutes]
       (setState ref (deref-with-tx ref tx)))
     (swap! stm dissoc id))
+  (doGet [tx iref]
+    (if (contains? @vals iref)
+      (get @vals iref)
+      (try (lock iref :read)
+           (when (nil? (.-tvals iref))
+             (throw (js/Error. (str iref " is unbound."))))
+           (let [ver (get @(.-tvals iref) id)]
+             (if (<= @readPoint (.-point (peek ver)))
+               (.-val (first (drop-while #(> (.-point %) @readPoint)
+                                         (reverse ver))))
+               (retry-transaction tx iref)))
+           (finally (unlock iref :read)))))
   (doSet [tx iref newval]
     (when (contains? @commutes iref)
       (throw (js/Error. "Can't set after commute")))
@@ -186,27 +201,71 @@
     newval)
   (doEnsure [tx iref]
     (when-not (contains? @ensures iref)
-      (and (.-tvals iref)
-           (> (.. iref -tvals -point) @read))))
+      (lock iref :read)
+      (when (and (.-tvals iref)
+                 (> (.. iref -tvals -point) @readPoint))
+        (unlock iref :read))
+      (if (write-locked? iref)
+        (do (unlock iref :read)
+            (when (== id (.-write_lock iref))))
+        (swap! ensures conj iref))))
   (doCommute [tx iref f args]
     (when-not (contains? @commutes iref)
       (swap! commutes conj iref))
-    (let [newval (apply f (cons (deref-with-tx iref tx) args))]
-      (swap! (.-tvals iref) update-in [id]
-             (fnil conj [(.-state iref)]) newval)
-      newval))
+    (try (lock iref :read)
+         (swap! vals assoc iref (get @(.-tvals iref) id))
+         (finally (unlock iref :read)))
+    (let [fns (get @commutes ref)]
+      (if (nil? fns)
+        (swap! commutes assoc ref [(delay #(f args))])
+        (swap! fns conj (delay #(f args))))
+      (let [ret (apply f (cons (get @vals iref) args))]
+        (swap! vals assoc iref ret)
+        ret)))
+  (run [tx f]
+    (let [locked (atom #{})
+          start-point (atom 0)
+          start-time (atom 0)]
+      (loop [i 0]
+        (when (< i 10000)
+          (try (swap! readPoint (swap! last inc))
+               (when (== i 0)
+                 (swap! start-point @readPoint)
+                 (swap! start-time (tx-id)))
+               (reset! status :running)
+               (let [ret (f)]
+                 (if (compare-and-set! status :running :committing)
+                   (doseq [[ref fun] @commutes]
+                     (when-not (contains? @sets ref)
+                       (let [^boolean ensured? (contains? @ensures ref)]
+                         ))))))))))
   (runInTransaction [tx f]
+    (try (run tx f)
+         (catch js/Error err
+           (if (identical? err RetryException)
+             (println err)
+             (throw err))
+           ;; (recur tx f)
+           )
+         (finally (swap! stm dissoc id)))
     (loop []
-      (swap! sets clear! tx)
-      (swap! ensures clear! tx)
-      (swap! commutes clear! tx)
-      (swap! vals clear! tx)
       (try (go (exhaust-channel (f))
                (commitTransaction tx))
            (catch js/Error err
              (if (identical? err RetryException)
                (do (println err) (recur))
                (throw err))))))
+  (stop [tx new-status]
+    (reset! status new-status)
+    (swap! vals clear! tx)
+    (swap! sets clear! tx)
+    (swap! commutes clear! tx))
+  (block-and-bail [tx ref] 
+    (stop tx :retry))
+  (release-if-ensured [tx ref]
+    (when (contains? @(.-ensures tx) ref)
+      (swap! (.-ensures tx) disj ref)
+      (unlock ref :read)))
   IPrintWithWriter
   (-pr-writer [tx writer opts]
     (pr-writer {:id id :sets sets :ensures ensures :commutes commutes
@@ -216,13 +275,12 @@
 (defn locking-transaction
   []
   (LockingTransaction. (tx-id)
-                       (atom (tx-set))
-                       (atom (tx-set))
-                       (atom (tx-set))
-                       (atom (avl/sorted-map-by
-                              #(compare (:tx-id (meta %1))
-                                        (:tx-id (meta %2)))))
-                       (atom 0) (atom 0)))
+                       (atom :init)
+                       (atom (sorted-set))
+                       (atom (sorted-set))
+                       (atom (sorted-set))
+                       (atom (sorted-map))
+                       (atom 0) (atom 0) (atom 0) (atom 0) (atom 0)))
 
 (defn ^:export -main []
   (let [r (ref 0)]
