@@ -1,5 +1,5 @@
 (ns stm.core
-  (:refer-clojure :exclude [dosync])
+  (:refer-clojure :exclude [dosync compare-and-set!])
   (:require [cljs.compiler :as comp]
             [cljs.analyzer :as ana]
             [cljs.env :as env]
@@ -35,3 +35,9 @@
               (if (identical? err# RetryException)
                 (recur tx# fn#)
                 (throw err#)))))))
+
+(defmacro compare-and-set!
+  [prop oldval newval]
+  `(if (identical? ~prop ~oldval)
+     (do (set! ~prop ~newval) true)
+     false))

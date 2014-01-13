@@ -1,4 +1,5 @@
 (ns stm.core
+  (:refer-clojure :exclude [compare-and-set!])
   (:require [clojure.browser.repl]
             [cljs.core.async :as a :refer [<! >! put! take! chan]]
             [clojure.set :as set]
@@ -6,7 +7,8 @@
             [cljs.core.async.impl.protocols :as impl]
             [cljs.core.async.impl.channels :refer [ManyToManyChannel]])
   (:require-macros [cljs.core.async.macros :as a :refer [go go-loop]]
-                   [stm.core :refer [<? dosync exhaust-channel]]))
+                   [stm.core :refer [<? dosync exhaust-channel
+                                     compare-and-set!]]))
 
 (enable-console-print!)
 
@@ -43,6 +45,8 @@
 (def KILLED 3)
 (def COMMITTED 4)
 
+(declare Info)
+
 (def stm (atom (sorted-map)))
 
 (def ids (atom 0))
@@ -78,9 +82,14 @@
   [tx]
   (> (- (tx-id) (.-startTime tx)) BARGE_WAIT_NANOS))
 
-(deftype TVal [point val])
+(deftype TVal [val point vals])
 
-(deftype Ref [id state read-lock write-lock tvals meta validator watches]
+(defn tval
+  ([val point] (TVal. val point []))
+  ([val point vals] (TVal. val point vals)))
+
+(deftype Ref [id state read-lock write-lock tvals tinfo hcount minHistory
+              maxHistory meta validator watches]
   IComparable
   (-compare [x y] (-compare id (.-id y)))
   ILock
@@ -140,6 +149,18 @@
   (deref-with-tx [iref tx]
     (or (peek (get @tvals (.-id tx))) state)))
 
+(defn ref-history-count
+  [ref]
+  (.-hcount ref))
+
+(defn ref-min-history
+  ([ref] (.-minHistory ref))
+  ([ref n] (set! (.-minHistory ref) n)))
+
+(defn ref-max-history
+  ([ref] (.-maxHistory ref))
+  ([ref n] (set! (.-maxHistory ref) n)))
+
 (defn ref-set
   [ref tx val]
   (when-not (write-locked? ref)
@@ -168,10 +189,11 @@
     (doCommute tx ref fun args)))
 
 (defn ref
-  ([state] (Ref. (swap! ids inc) state nil nil (atom {}) nil nil nil))
-  ([state & {:keys [meta validator]}]
-     (Ref. (swap! ids inc) state nil nil (atom (avl/sorted-map)) meta
-           validator nil)))
+  ([state]
+     (Ref. (swap! ids inc) state nil nil (atom {}) nil 0 0 10 nil nil nil))
+  ([state & {:keys [meta validator min-history max-history]}]
+     (Ref. (swap! ids inc) state nil nil (atom (avl/sorted-map)) nil 0
+           min-history max-history meta validator nil)))
 
 (defn clear!
   [refs tx]
@@ -206,7 +228,11 @@
 
 (deftype Info [status startPoint latch])
 
-(deftype LockingTransaction [id status sets ensures commutes vals startPoint
+(defn ^boolean running?
+  [info]
+  (or (== (.-status info) RUNNING) (== (.-status info) COMMITTING)))
+
+(deftype LockingTransaction [id info sets ensures commutes vals startPoint
                              readPoint writePoint lastPoint startTime]
   IEquiv
   (-equiv [x y] (identical? x y))
@@ -265,22 +291,52 @@
         (swap! vals assoc iref ret)
         ret)))
   (run [tx f]
-    (let [locked (atom #{})
-          start-point (atom 0)
-          start-time (atom 0)]
+    (let [locked (atom #{})]
       (loop [i 0]
         (when (< i 10000)
           (try (swap! readPoint (swap! last inc))
                (when (== i 0)
-                 (swap! start-point @readPoint)
-                 (swap! start-time (tx-id)))
-               (reset! status RUNNING)
-               (let [ret (f)]
-                 (if (compare-and-set! status RUNNING COMMITTING)
-                   (doseq [[ref fun] @commutes]
-                     (when-not (contains? @sets ref)
-                       (let [^boolean ensured? (contains? @ensures ref)]
-                         ))))))))))
+                 (swap! startPoint @readPoint)
+                 (swap! startTime (tx-id)))
+               (let [info (set! (.-info tx)
+                                (Info. RUNNING @startPoint (latch 1)))]
+                 (let [ret (f)]
+                   (if (compare-and-set! (.-status info) RUNNING COMMITTING)
+                     (doseq [[ref funs] @commutes]
+                       (when-not (contains? @sets ref)
+                         (let [^boolean ensured? (contains? @ensures ref)]
+                           (release-if-ensured tx ref)
+                           (tryWriteLock tx ref)
+                           (swap! locked conj ref)
+                           (when (and ensured?
+                                      (not (nil? (.-tvals ref)))
+                                      (> (.. ref -tvals -point) @readPoint))
+                             (retry-transaction tx ref))
+                           (let [refinfo (.-tinfo ref)]
+                             (when (and (not (nil? refinfo))
+                                        (not (identical? refinfo info))
+                                        (running? refinfo))
+                               (when-not (barge tx refinfo)
+                                 (retry-transaction tx ref)))
+                             (let [oldval (.-val (get (.-tvals ref) id))]
+                               (swap! vals assoc ref oldval)
+                               (doseq [fun funs]
+                                 (swap! vals assoc ref (fun (get @vals ref))))
+                               (doseq [ref @sets]
+                                 (tryWriteLock tx ref)
+                                 (swap! locked conj ref))
+                               (doseq [[ref val] @vals]
+                                 (let [validator (get-validator ref)]
+                                   (assert (validator val)
+                                           "Invalid ref state")))
+                               (let [commitPoint (swap! lastPoint inc)]
+                                 (doseq [[ref newval] @vals]
+                                   (cond
+                                     (nil? (get @(.-tvals ref) id))
+                                     (swap! (get @(.-tvals ref) id) assoc id
+                                            (tval newval commitPoint))
+                                     )
+                                   )))))))))))))))
   (runInTransaction [tx f]
     (try (run tx f)
          (catch js/Error err
@@ -298,7 +354,7 @@
                (do (println err) (recur))
                (throw err))))))
   (stop [tx new-status]
-    (reset! status new-status)
+    (set! (.-status info) new-status)
     (swap! vals clear! tx)
     (swap! sets clear! tx)
     (swap! commutes clear! tx))
@@ -320,8 +376,11 @@
            (when (and (seq @(.-tvals ref))
                       (> (.-point (peek (get @(.-tvals ref) id))) readPoint))
              (retry-transaction tx ref))
-           (when (and (== RUNNING status) )
-             (when-not (barge tx ref))))))
+           (let [refinfo (.-tinfo ref)]
+             (when (and (not (nil? refinfo))
+                        (not (identical? refinfo info))
+                        (== RUNNING (.-status refinfo)))
+               (when-not (barge tx ref)))))))
   IPrintWithWriter
   (-pr-writer [tx writer opts]
     (pr-writer {:id id :sets sets :ensures ensures :commutes commutes
@@ -331,7 +390,7 @@
 (defn locking-transaction
   []
   (LockingTransaction. (tx-id)
-                       (atom RUNNING)
+                       nil
                        (atom (sorted-set))
                        (atom (sorted-set))
                        (atom (sorted-map))
