@@ -81,26 +81,6 @@
   [tx]
   (> (- (tx-id) (.-startTime tx)) BARGE_WAIT_NANOS))
 
-(defn read-lock
-  [ref]
-  (let [readers (chan 1) unlock (chan 1)]
-    (go-loop []
-      (when-let [reader (<! readers)]
-        (set! (.-write-lock ref) (.-id reader))
-        (when-let [unlocked (<! unlock)]
-          (recur))))
-    [readers unlock]))
-
-(defn write-lock
-  [ref]
-  (let [writers (chan 1) readers (chan 1) unlock (chan 1)]
-    (go-loop []
-      (when-let [reader (<! readers)]
-        (set! (.-write-lock ref) (.-id reader))
-        (when-let [unlocked (<! unlock)]
-          (recur))))
-    [readers unlock]))
-
 (defn reentrant-read-write-lock
   []
   (let [writers (chan 1)
@@ -157,12 +137,7 @@
   IMeta
   (-meta [_] meta)
   IDeref
-  (-deref [iref]
-    (if-let [tx-id write-lock]
-      (try (lock iref :read)
-           (.-val (peek (get @tvals tx-id)))
-           (finally (unlock iref :read)))
-      state))
+  (-deref [iref] state)
   IWatchable
   (-notify-watches [iref oldval newval]
     (doseq [[key f] watches]
@@ -237,13 +212,16 @@
 
 (defn ref
   ([state]
-     (Ref. (swap! ids inc) state nil nil (chan 64) (chan 64)
-           (atom (sorted-map)) nil (atom 0) 0
-           10 nil nil nil))
+     (let [[writers readers write-unlock read-unlock]
+           (reentrant-read-write-lock)]
+       (Ref. (swap! ids inc) state writers readers write-unlock read-unlock
+             (atom (sorted-map)) nil (atom 0) 0 10 nil nil nil)))
   ([state & {:keys [meta validator min-history max-history]}]
-     (Ref. (swap! ids inc) state nil nil (chan 64) (chan 64)
-           (atom (sorted-map)) nil (atom 0) min-history max-history meta
-           validator nil)))
+     (let [[writers readers write-unlock read-unlock]
+           (reentrant-read-write-lock)]
+       (Ref. (swap! ids inc) state writers readers write-unlock read-unlock
+             (atom (sorted-map)) nil (atom 0) min-history max-history meta
+             validator nil))))
 
 (deftype CFn [fn args])
 
@@ -298,20 +276,20 @@
   (-compare [x y] (-compare id (.-id y)))
   ITransaction
   (doGet [tx iref]
-    (when-not (running? info)
-      (throw RetryException))
-    (if (contains? @vals iref)
-      (get @vals iref)
-      (try (lock iref :read)
-           (when (nil? (.-tvals iref))
-             (throw (js/Error. (str iref " is unbound."))))
-           (let [ver (get @(.-tvals iref) id)
-                 val (.-val (first (drop-while #(> (.-point %) @readPoint)
-                                               (reverse ver))))]
-             (if-not val
-               (do (swap! (.-faults iref) inc) (throw RetryException))
-               val))
-           (finally (unlock iref :read)))))
+    (go (when-not (running? info)
+          (throw RetryException))
+        (if (contains? @vals iref)
+          (get @vals iref)
+          (try (<! (lock iref tx :read))
+               (when (nil? (.-tvals iref))
+                 (throw (js/Error. (str iref " is unbound."))))
+               (let [ver (get @(.-tvals iref) id)
+                     val (.-val (first (drop-while #(> (.-point %) @readPoint)
+                                                   (reverse ver))))]
+                 (if-not val
+                   (do (swap! (.-faults iref) inc) (throw RetryException))
+                   val))
+               (finally (unlock iref tx :read))))))
   (doSet [tx iref newval]
     (when-not (running? info)
       (throw RetryException))
@@ -319,21 +297,21 @@
       (throw (js/Error. "Can't set after commute")))
     (when-not (contains? @sets iref)
       (swap! sets conj iref)
-      (lock iref tx)
+      (lock-tx tx iref)
       (swap! vals assoc iref newval))
     newval)
   (doEnsure [tx iref]
     (when-not (running? info)
       (throw RetryException))
     (when-not (contains? @ensures iref)
-      (lock iref :read)
+      (lock iref tx :read)
       (when (and (get @(.-tvals iref) id)
                  (> (.-point (peek (get @(.-tvals iref) id))) @readPoint))
-        (unlock iref :read)
+        (unlock iref tx :read)
         (throw RetryException))
       (let [refinfo (.-tinfo iref)]
         (if (and refinfo (running? refinfo))
-          (do (unlock iref :read)
+          (do (unlock iref tx :read)
               (when-not (identical? refinfo info)
                 (go (<? (block-and-bail tx refinfo)))))
           (swap! ensures conj iref)))))
@@ -343,7 +321,7 @@
     (when-not (contains? @vals ref)
       (try (lock iref :read)
            (swap! vals assoc iref (.-val (peek (get @(.-tvals iref) id))))
-           (finally (unlock iref :read))))
+           (finally (unlock iref tx :read))))
     (let [funs (get @commutes ref)]
       (when (nil? funs)
         (swap! commutes assoc ref []))
@@ -454,10 +432,13 @@
   (release-if-ensured [tx ref]
     (when (contains? @(.-ensures tx) ref)
       (swap! (.-ensures tx) disj ref)
-      (unlock ref :read)))
+      (unlock ref tx :read)))
   (tryWriteLock [tx ref]
-    (try (when-not (lock ref tx)
-           (throw RetryException))
+    (try (let [lk (a/do-alts (fn [val] val) [(lock ref tx)] {})]
+           (if (nil? lk)
+             (do (unlock ref tx)
+                 (throw RetryException))
+             lk))
          (catch js/Error err (throw err))))
   (barge [tx refinfo]
     (when (and (barge-time-elapsed? tx) (< startPoint (.-startPoint refinfo)))
@@ -466,22 +447,23 @@
           (countDown (.-latch refinfo)))
         barged)))
   (lock-tx [tx ref]
-    (release-if-ensured tx ref)
-    (let [unlocked (atom true)]
-      (try (tryWriteLock tx ref)
-           (reset! unlocked false)
-           (when (and (get @(.-tvals ref) id)
-                      (> (.-point (peek (get @(.-tvals ref) id))) @readPoint))
-             (throw RetryException))
-           (let [refinfo (.-tinfo ref)]
-             (when (and (not (nil? refinfo))
-                        (not (identical? refinfo info))
-                        (running? refinfo)
-                        (not (barge tx refinfo)))
-               (set! (.-tinfo ref) info)
-               (.-val (peek (get @(.-tvals ref) id)))))
-           (finally (when-not @unlocked
-                      (unlock ref tx))))))
+    (go (release-if-ensured tx ref)
+        (let [unlocked (atom true)]
+          (try (let [[_ write-lock] @(tryWriteLock tx ref)]
+                 (reset! unlocked false)
+                 (when (and (get @(.-tvals ref) id)
+                            (> (.-point (peek (get @(.-tvals ref) id)))
+                               @readPoint))
+                   (throw RetryException))
+                 (let [refinfo (.-tinfo ref)]
+                   (when (and (not (nil? refinfo))
+                              (not (identical? refinfo info))
+                              (running? refinfo)
+                              (not (barge tx refinfo)))
+                     (set! (.-tinfo ref) info)
+                     (.-val (peek (get @(.-tvals ref) id))))))
+               (finally (when-not @unlocked
+                          (unlock ref tx)))))))
   IPrintWithWriter
   (-pr-writer [tx writer opts]
     (pr-writer {:id id :info info :sets sets :ensures ensures
