@@ -9,7 +9,7 @@
   [expr]
   `(let [ret# ~expr]
      (if (or (instance? cljs.core.async.impl.channels/ManyToManyChannel ret#)
-             (core/implements? cljs.core.async.impl.protocols/ReadPort ret#))
+             (satisfies? cljs.core.async.impl.protocols/ReadPort ret#))
        (throw-err (cljs.core.async/<! ret#))
        ret#)))
 
@@ -17,7 +17,7 @@
   [expr]
   `(loop [ret# ~expr]
      (if (or (instance? cljs.core.async.impl.channels/ManyToManyChannel ret#)
-             (core/implements? cljs.core.async.impl.protocols/ReadPort ret#))
+             (satisfies? cljs.core.async.impl.protocols/ReadPort ret#))
        (recur (<? ret#))
        ret#)))
 
@@ -28,11 +28,10 @@
                          (locking-transaction))
          tx# ~binding-name]
      (swap! stm assoc (.-id tx#) tx#)
-     (cljs.core.async.macros/go-loop
-       [fn# (fn [] (cljs.core.async.macros/go ~@body))
-        tx# tx#]
-       (try (exhaust-channel (runInTransaction tx# fn#))
+     (loop [fn# (fn [] ~@body)
+            tx# tx#]
+       (try (runInTransaction tx# fn#)
             (catch js/Error err#
               (if (identical? err# RetryException)
-                (runInTransaction tx# fn#)
+                (recur tx# fn#)
                 (throw err#)))))))

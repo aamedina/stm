@@ -11,23 +11,27 @@
 (enable-console-print!)
 
 (defprotocol ILock
-  (lock [_ tx])
-  (unlock [_ tx])
-  (locked? [_]))
+  (lock [_ tx] [_ tx read?])
+  (unlock [_ tx] [_ tx read?])
+  (^boolean read-locked? [_])
+  (^boolean write-locked? [_]))
 
 (defprotocol IRef
   (setState [iref newval])
   (commitRef [iref tx])
+  (touch [iref tx])
   (deref-with-tx [iref tx]))
 
 (defprotocol ITransaction
   (commitTransaction [tx])
   (doSet [tx ref newval])
-  (doAlter [tx ref f args])
+  (doEnsure [tx ref])
   (doCommute [tx ref f args])
   (runInTransaction [tx f]))
 
 (def stm (atom (avl/sorted-map-by #(compare (.-id %1) (.-id %2)))))
+
+(def ids (atom 0))
 
 (def RetryException (ex-info "RETRY" {}))
 
@@ -36,7 +40,7 @@
   (swap! (.-tvals iref) dissoc (.-id tx))
   (throw RetryException))
 
-(defn error?
+(defn ^boolean error?
   [x]
   (instance? js/Error x))
 
@@ -46,7 +50,7 @@
     (throw x)
     x))
 
-(defn tx-id
+(defn ^number tx-id
   []
   (cond
     (exists? js/window.performance.now) (js/window.performance.now)
@@ -60,24 +64,34 @@
      (apply avl/sorted-set-by
             #(compare (:tx-id (meta %1)) (:tx-id (meta %2))) ks)))
 
-(deftype Ref [state lock tvals meta validator watches]
+(deftype Ref [id state read-lock write-lock tvals meta validator watches]
+  IComparable
+  (-compare [x y]
+    (if (instance? Ref y)
+      (-compare id (.-id y))
+      false))
   ILock
   (lock [iref tx]
-    (set! (.-lock iref) (.-id tx)))
+    (set! (.-write_lock iref) (.-id tx)))
+  (lock [iref tx read?]
+    (set! (.-read_lock iref) (.-id tx)))
   (unlock [iref tx]
-    (when (== lock (.-id tx))
-      (set! (.-lock iref) nil)))
-  (locked? [iref] (not (nil? lock)))
+    (when (== write-lock (.-id tx))
+      (set! (.-write_lock iref) nil)))
+  (unlock [iref tx read?]
+    (when (== read-lock (.-id tx))
+      (set! (.-read_lock iref) nil)))
+  (read-locked? [iref] (not (nil? read-lock)))
+  (write-locked? [iref] (not (nil? write-lock)))
   IEquiv
   (-equiv [iref other] (identical? iref other))
-  IWithMeta
-  (-with-meta [iref meta]
-    (set! (.-meta iref) meta)
-    iref)
   IMeta
   (-meta [_] meta)
   IDeref
-  (-deref [iref] state)
+  (-deref [iref]
+    (if (write-locked? iref)
+      (peek (get @tvals lock))
+      state))
   IWatchable
   (-notify-watches [iref oldval newval]
     (doseq [[key f] watches]
@@ -94,6 +108,8 @@
     (pr-writer state writer opts)
     (-write writer ">"))
   IRef
+  (touch [iref tx]
+    (doEnsure tx iref))
   (setState [iref newval]
     (when-not (nil? validator)
       (assert (validator newval) "Validated rejected reference state"))
@@ -111,20 +127,36 @@
 
 (defn ref-set
   [ref tx val]
-  (doSet tx ref val))
+  (when-not (write-locked? ref)
+    (doSet tx ref val)))
 
 (defn alter
-  [ref tx fun & args]
-  (doAlter tx ref fun args))
+  ([ref tx fun]
+     (when-not (write-locked? ref)
+       (doSet tx ref (fun (deref-with-tx ref tx)))))
+  ([ref tx fun x]
+     (when-not (write-locked? ref)
+       (doSet tx ref (fun (deref-with-tx ref tx) x))))
+  ([ref tx fun x y]
+     (when-not (write-locked? ref)
+       (doSet tx ref (fun (deref-with-tx ref tx) x y))))
+  ([ref tx fun x y z]
+     (when-not (write-locked? ref)
+       (doSet tx ref (fun (deref-with-tx ref tx) x y z))))
+  ([ref tx fun x y z & more]
+     (when-not (write-locked? ref)
+       (doSet tx ref (apply fun (deref-with-tx ref tx) x y z more)))))
 
 (defn commute
   [ref tx fun & args]
-  (doCommute tx ref fun args))
+  (when-not (write-locked? ref)
+    (doCommute tx ref fun args)))
 
 (defn ref
-  ([state] (Ref. state (atom {}) nil nil nil))
+  ([state] (Ref. (swap! ids inc) state nil nil (atom {}) nil nil nil))
   ([state & {:keys [meta validator]}]
-     (Ref. state (atom (avl/sorted-map)) meta validator nil)))
+     (Ref. (swap! ids inc) state nil nil (atom (avl/sorted-map)) meta
+           validator nil)))
 
 (defn clear!
   [refs tx]
@@ -134,53 +166,51 @@
         (empty refs))
     refs))
 
-(deftype LockingTransaction [id sets alters commutes]
+(deftype LockingTransaction [id sets ensures commutes vals read write]
   ITransaction
   (commitTransaction [tx]
-    (let [refs (reduce into (tx-set) [@sets @alters @commutes])]
-      (doseq [ref refs]
-        (commitRef ref tx))
-      (swap! stm dissoc id)))
+    (doseq [ref @sets]
+      (commitRef ref tx))
+    (doseq [ref @ensures]
+      (commitRef ref tx))
+    (doseq [ref @commutes]
+      (setState ref (deref-with-tx ref tx)))
+    (swap! stm dissoc id))
   (doSet [tx iref newval]
+    (when (contains? @commutes iref)
+      (throw (js/Error. "Can't set after commute")))
     (when-not (contains? @sets iref)
-      (swap! sets conj (with-meta iref {:tx-id (tx-id)})))
-    (let [state (or (first (get @(.-tvals iref) id)) (.-state iref))]
-      (if (identical? (.-state iref) state)
-        (swap! (.-tvals iref) update-in [id]
-               (fnil conj [(.-state iref)]) newval)
-        (retry-transaction tx iref))
-      newval))
-  (doAlter [tx iref f args]
-    (when-not (contains? @alters iref)
-      (swap! alters conj (with-meta iref {:tx-id (tx-id)})))
-    (let [newval (apply f (cons (deref-with-tx iref tx) args))
-          state (or (first (get @(.-tvals iref) id)) (.-state iref))]
-      (if (identical? (.-state iref) state)
-        (swap! (.-tvals iref) update-in [id]
-               (fnil conj [(.-state iref)]) newval)
-        (retry-transaction tx iref))
-      newval))
+      (swap! sets conj iref)
+      (lock iref tx)
+      (swap! vals assoc iref newval))
+    newval)
+  (doEnsure [tx iref]
+    (when-not (contains? @ensures iref)
+      (and (.-tvals iref)
+           (> (.. iref -tvals -point) @read))))
   (doCommute [tx iref f args]
     (when-not (contains? @commutes iref)
-      (swap! commutes conj (with-meta iref {:tx-id (tx-id)})))
+      (swap! commutes conj iref))
     (let [newval (apply f (cons (deref-with-tx iref tx) args))]
       (swap! (.-tvals iref) update-in [id]
              (fnil conj [(.-state iref)]) newval)
       newval))
   (runInTransaction [tx f]
-    (go-loop []
+    (loop []
       (swap! sets clear! tx)
-      (swap! alters clear! tx)
+      (swap! ensures clear! tx)
       (swap! commutes clear! tx)
-      (try (exhaust-channel (f))
-           (commitTransaction tx)
+      (swap! vals clear! tx)
+      (try (go (exhaust-channel (f))
+               (commitTransaction tx))
            (catch js/Error err
              (if (identical? err RetryException)
-               (recur)
+               (do (println err) (recur))
                (throw err))))))
   IPrintWithWriter
   (-pr-writer [tx writer opts]
-    (pr-writer {:id id :sets sets :alters alters :commutes commutes}
+    (pr-writer {:id id :sets sets :ensures ensures :commutes commutes
+                :vals vals}
                writer opts)))
 
 (defn locking-transaction
@@ -188,13 +218,28 @@
   (LockingTransaction. (tx-id)
                        (atom (tx-set))
                        (atom (tx-set))
-                       (atom (tx-set))))
+                       (atom (tx-set))
+                       (atom (avl/sorted-map-by
+                              #(compare (:tx-id (meta %1))
+                                        (:tx-id (meta %2)))))
+                       (atom 0) (atom 0)))
 
 (defn ^:export -main []
   (let [r (ref 0)]
-    (dotimes [i 10]
-      (go (<! (dosync tx
-                (dotimes [i 10]
-                  (alter r tx inc))))
-          (println "Committed value of ref is :" @r)))
+    (go (time (<! (dosync tx
+                    (dotimes [i 10000]
+                      (alter r tx inc)))))
+        (println "Committed value of ref is :" @r))
+    (go (dotimes [i 10]
+          (<! (go (<! (dosync tx
+                        (dotimes [i 10]
+                          (alter r tx inc)))))))
+        (println "Committed value of ref is :" @r))
     (def r r)))
+
+    ;; (let [state (or (first (get @(.-tvals iref) id)) (.-state iref))]
+    ;;   (if (identical? (.-state iref) state)
+    ;;     (swap! (.-tvals iref) update-in [id]
+    ;;            (fnil conj [(.-state iref)]) newval)
+    ;;     (retry-transaction tx iref))
+    ;;   newval)
